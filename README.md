@@ -37,20 +37,25 @@ jupyter notebook run.ipynb
 
 ---
 
-## 2. Quantitative Verification Metrics
+## 2. Example Output Videos & Quantitative Verification
 
+### Example Processed Output Videos
+* [**`output_match.mp4`**](output_match.mp4): Example output video for Match 1 (`0bfacc_0.mp4` — Red vs. White teams, 1080p, 25 fps, 30s).
+* [**`output_2.mp4`**](output_2.mp4): **Example output video for Match 2** (`Video_2.mp4` — Navy vs. White teams, 1080p, 25 fps, 30s), demonstrating cross-match generalizability with persistent ByteTrack tracking, team tags, and HUD scoreboard.
+
+### Quantitative Verification Metrics
 Evaluated on official broadcast match footage (1080p @ 25 fps, 750 frames / 30.0s):
 
-| Evaluation Metric | Production Result | Benchmark Standard / Requirement |
-|---|---|---|
-| **Label Flip Rate (Temporal Stability)** | **0.49%** | **Target: < 5.0%** (Exceeded by 10x) |
-| **Flicker Reduction** | **90.86%** | Eliminates inter-frame strobing |
-| **Raw Per-Frame Flips vs. Smoothed** | 1,050 raw $\to$ **96 smoothed** | Robust majority-vote stabilization |
-| **Kit Color Separation ($\Delta E^*_{ab}$)** | **69.07** | Perceptually massive separation |
-| **PCA Explained Variance (6 components)** | **95.30%** | Compact, discriminative manifold |
-| **Detections Logged (Match 1)** | **19,538** | 0 null/NaN values across all fields |
-| **Unique Track IDs (ByteTrack)** | **76** | Persistent player trajectories |
-| **Officials & GK Isolation** | **3,599 Ref / 3,631 GK** | Zero contamination of team clusters |
+| Evaluation Metric | Match 1 (`output_match.mp4`) | Match 2 Example (`output_2.mp4`) | Benchmark Standard |
+|---|---|---|---|
+| **Label Flip Rate (Stability)** | **0.49%** | **0.48%** | **Target: < 5.0%** (Exceeded by 10x) |
+| **Flicker Reduction** | **90.86%** | **94.39%** | Eliminates inter-frame strobing |
+| **Raw Flips vs. Smoothed** | 1,050 $\to$ **96** | 1,461 $\to$ **82** | Rolling majority-vote stabilization |
+| **Kit Separation ($\Delta E^*_{ab}$)** | **69.07** | **61.80** | Perceptually massive separation |
+| **PCA Explained Variance** | **95.30%** | **95.51%** | Discriminative color manifold |
+| **Detections Logged** | **19,538** (0 nulls) | **17,220** (0 nulls) | Zero-null field guarantee |
+| **Unique Track IDs** | **76** | **48** | Persistent ByteTrack trajectories |
+| **Officials & GK Isolation** | **3,599 Ref / 3,631 GK** | **4,112 Ref / 1,526 GK** | Zero team cluster contamination |
 
 ---
 
@@ -131,10 +136,10 @@ Maatra Assessment/
 ├── detections_log.json            # JSON export of Match 1 detections
 ├── run_summary.json               # Diagnostic metrics (flip rate, delta E, variance)
 │
-├── output_2.mp4                   # Rendered 30s 1080p match video (Match 2)
-├── output_2.csv                   # Structured detection CSV (17,220 rows, 0 nulls)
+├── output_2.mp4                   # Example output video (Match 2: Navy vs. White, 1080p, 30s)
+├── output_2.csv                   # Structured detection CSV for Match 2 (17,220 rows, 0 nulls)
 ├── output_2.json                  # JSON export of Match 2 detections
-├── output_2_summary.json          # Diagnostic metrics for Match 2
+├── output_2_summary.json          # Diagnostic metrics for Match 2 (0.48% flip rate)
 │
 ├── data/                          # Benchmark 1080p broadcast clips
 │   ├── 0bfacc_0.mp4               # Match 1 clip
