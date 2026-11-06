@@ -1,0 +1,32 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Virtual environments
+.venv/
+env/
+venv/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Model weights (YOLO downloads automatically from Ultralytics release if missing)
+*.pt
+yolov8x-seg.pt
+
+# Intermediate outputs and logs
+outputs/test*
+outputs/*.log
+
+# User local scratch
+scratch/
