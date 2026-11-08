@@ -85,7 +85,7 @@ Inspect learned cluster centroids for `Team A (Squad 1)`, `Team B (Squad 2)`, `O
 """)
 
 code(r"""
-summary = json.loads(Path("run_summary.json").read_text())
+summary = json.loads(Path("deliverables/match_1/run_summary.json").read_text())
 tm = summary["team_model"]
 
 print(f"Warmup samples: {tm['warmup_samples']}")
@@ -117,7 +117,7 @@ Verifying that label flips remain well under the 5% threshold across all detecti
 """)
 
 code(r"""
-df = pd.read_csv("detections_log.csv")
+df = pd.read_csv("deliverables/match_1/detections_log.csv")
 print(f"Total Detections Logged: {len(df):,}")
 print(f"Unique Player Tracks: {df.player_id.nunique()}")
 print(f"Group Distribution:")
@@ -150,11 +150,11 @@ plt.show()
 
 md(r"""
 ## Annotated Video Inspection
-Sample rendered frames from `output_match.mp4` showing bounding box classifications and HUD overlay.
+Sample rendered frames from `deliverables/match_1/output_match.mp4` showing bounding box classifications and HUD overlay.
 """)
 
 code(r"""
-cap = cv2.VideoCapture("output_match.mp4")
+cap = cv2.VideoCapture("deliverables/match_1/output_match.mp4")
 n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 fig, axes = plt.subplots(1, 3, figsize=(18, 4.5))
 for ax, fi in zip(axes, [50, 350, 650]):

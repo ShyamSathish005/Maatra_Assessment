@@ -824,8 +824,8 @@ class MatchAnalysisPipeline:
             cv2.putText(frame, f"{GROUP_DESCRIPTIONS[g].split(' (')[0]}: {counts.get(g, 0)}", (50, y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
 
-    def run(self, input_video: str, output_video: str = "output_match.mp4",
-            output_csv: Optional[str] = "detections_log.csv", output_json: Optional[str] = None,
+    def run(self, input_video: str, output_video: str = "deliverables/match_1/output_match.mp4",
+            output_csv: Optional[str] = "deliverables/match_1/detections_log.csv", output_json: Optional[str] = None,
             summary_path: Optional[str] = None) -> Dict:
         c = self.cfg
         warm = self.warmup_and_fit(input_video) if not self.is_fitted else self.clusterer.stats
@@ -935,8 +935,10 @@ class MatchAnalysisPipeline:
                 "group_name", "raw_group_id", "group_conf", "det_conf", "timestamp_s"]
         df = pd.DataFrame.from_records(records) if records else pd.DataFrame(columns=cols)
         if output_csv:
+            Path(output_csv).parent.mkdir(parents=True, exist_ok=True)
             df.to_csv(output_csv, index=False)
         if output_json:
+            Path(output_json).parent.mkdir(parents=True, exist_ok=True)
             df.to_json(output_json, orient="records", indent=1)
 
         def flips(h: Dict[int, List[int]]) -> int:
@@ -963,6 +965,7 @@ class MatchAnalysisPipeline:
             "config": asdict(c),
         }
         if summary_path:
+            Path(summary_path).parent.mkdir(parents=True, exist_ok=True)
             Path(summary_path).write_text(json.dumps(summary, indent=2, default=str))
 
         LOG.info("Run finished: %d frames in %.1fs | raw flips=%d, smoothed flips=%d (flip rate=%.2f%%)",
@@ -980,10 +983,10 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--input", required=True, help="Input broadcast video path")
-    p.add_argument("--output_video", default="output_match.mp4")
-    p.add_argument("--output_csv", default="detections_log.csv")
-    p.add_argument("--output_json", default="detections_log.json")
-    p.add_argument("--summary", default="run_summary.json")
+    p.add_argument("--output_video", default="deliverables/match_1/output_match.mp4")
+    p.add_argument("--output_csv", default="deliverables/match_1/detections_log.csv")
+    p.add_argument("--output_json", default="deliverables/match_1/detections_log.json")
+    p.add_argument("--summary", default="deliverables/match_1/run_summary.json")
     p.add_argument("--model", default=d.model)
     p.add_argument("--imgsz", type=int, default=d.imgsz)
     p.add_argument("--conf", type=float, default=d.conf)
