@@ -119,6 +119,16 @@ Outputs: output_match.mp4 + detections_log.csv + detections_log.json + run_summa
   * **Global Fit-Once Model**: The clustering model is fitted once during the warmup phase (150 frames) and frozen; subsequent frames call `predict()`. Deterministic CIELAB hue sorting guarantees consistent Team A / Team B assignment across runs.
   * **Rolling Majority Vote**: A 30-frame rolling deque per ByteTrack ID with tie-break hysteresis reduces label flips from **1,050 to 96** (flip rate of 0.49%).
 
+### Edge Cases & Production Considerations
+* **Single-Frame Sprint & Motion Blur Dynamics**:
+  * Under extreme camera pans, high-velocity sprints, or tight player-on-player occlusions (e.g., tackles and corner kick scrums), momentary motion blur and pixel blending de-saturate chromaticity channels ($a^*, b^*$).
+  * This physical broadcast constraint can cause isolated, single-frame raw classification perturbations before the 30-frame rolling majority vote re-locks the track identity.
+  * Despite these broadcast camera artifacts, the temporal smoothing layer sustains an overall track label stability of **>99.5%** (**0.49% flip rate** across 19,538 detection instances in Match 1, and **0.48%** across 17,220 instances in Match 2).
+* **Production Roadmap & Next-Stage Enhancements**:
+  * **Optical Flow Velocity Conditioning**: Integrate dense or sparse optical flow vectors into the tracker association cost matrix to adaptively scale color weighting during rapid camera pans.
+  * **Online Kalman Filtering on Color Distributions**: Replace the discrete rolling majority vote with an online recursive Bayesian filter / Kalman filter directly on the continuous CIELAB feature distribution per track.
+  * **Self-Supervised Backbone Integration**: When high-end GPU acceleration (e.g., NVIDIA TensorRT / CUDA) is available, pass the eroded torso crop through a frozen self-supervised vision backbone (such as DINOv2 `dinov2_vits14` CLS tokens, already scaffolded in `pipeline.py`) to add semantic texture embeddings alongside perceptual color histograms.
+
 ---
 
 ## 5. Repository Structure
