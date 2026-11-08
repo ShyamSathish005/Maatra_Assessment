@@ -1,10 +1,9 @@
-# ByteTrack tuned for broadcast football (players occlude each other constantly).
+# ByteTrack tuned for universal broadcast sports (high-speed player occlusions & camera pans).
 # Detector runs at conf=0.1 so low-score boxes reach ByteTrack's 2nd association stage.
 tracker_type: bytetrack
 track_high_thresh: 0.4   # 1st-stage association with confident boxes
 track_low_thresh: 0.1    # 2nd-stage: recover occluded / motion-blurred players
 new_track_thresh: 0.5    # only confident boxes may spawn a new ID (fewer ghost tracks)
-track_buffer: 60         # keep lost tracks 2 s @30fps -> IDs survive tackles / crossings
+track_buffer: 60         # keep lost tracks 2 s @30fps -> IDs survive scrums / screens / crossovers
 match_thresh: 0.8
 fuse_score: True
-

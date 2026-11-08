@@ -1,29 +1,34 @@
 #!/usr/bin/env python3
 """
-Unsupervised football team identification from broadcast video.
+Universal Zero-Annotation Sports Player Detection, Tracking & Team Color Clustering.
 
-5-Stage Sports Analytics Pipeline:
+Sport-agnostic 5-stage computer vision pipeline for any two-team broadcast sport
+(Football, Basketball, Tennis, Hockey, Volleyball, Rugby, American Football):
+
 1. Detection, Segmentation & Tracking:
-   - YOLOv8x-seg (COCO class 0: person) + ByteTrack
-   - Convex pitch-hull filtering to remove crowd, bench, and ball boys
-2. Pitch & Torso Isolation:
-   - Upper-torso geometric crop: 15% to 42% height, 22% to 78% width
-   - Dynamic HSV pitch-green exclusion mask (H in [35, 85], S > 40, V > 40)
-   - 2-pixel morphological erosion (cv2.erode with 3x3 kernel, 2 iterations)
-     prior to color sampling to strip antialiased grass boundary bleed
+   - YOLOv8x-seg (COCO class 0: person) + ByteTrack (configs/bytetrack_sports.yaml)
+   - Dynamic playing-surface convex hull filter to remove off-court crowd, bench, and staff
+2. Dynamic Playing Surface Learning & Geometric Torso Isolation:
+   - Automated background color estimator samples non-player pixels outside detected
+     person bounding boxes/masks and computes the dominant playing-surface centroid
+     in CIELAB space (eliminates green turf, tan hardwood, blue/red clay, or white ice)
+   - Pure geometric upper-torso crop: 18% to 40% height, 25% to 75% width
+   - 2-pixel morphological erosion (cv2.erode with 3x3 kernel, 2 iterations) on the
+     person silhouette mask to strip antialiased court/surface boundary bleed
 3. Feature Representation & Lightness Invariance:
    - Mini-KMeans (k=2) on masked torso pixels to extract dominant CIELAB cluster
    - Down-weight lightness L* by 0.3 relative to chromatic channels (a*, b*)
    - Normalized 16x16 a*b* 2D histogram under Hellinger distance
-   - Unsupervised neon anomaly filter in HSV (S > 185, V > 195, 25 <= H <= 50)
-4. Neon & Outlier Separation (Referee / GK Isolation):
-   - Warmup sample bank fitted with unsupervised K=5 over-clustering (GMM/K-Means)
-   - Two highest-frequency clusters assigned to Team A (group_id = 0) and Team B (group_id = 1)
-   - Remaining lower-frequency clusters routed to Officials / Goalkeepers (group_id = 2 and group_id = 3)
-   - Neon detections tagged as official/outlier anomaly before centroid distance calculation
+   - Unsupervised high-visibility neon anomaly detector in HSV (S > 185, V > 195, 25 <= H <= 50)
+4. Unsupervised Over-Clustering & Outlier Separation (Officials / Specialists):
+   - Warmup sample bank fitted with unsupervised K=5 over-clustering in PCA space
+   - Two highest-frequency clusters assigned to Team A (Squad 1, group_id = 0)
+     and Team B (Squad 2, group_id = 1)
+   - Remaining lower-frequency clusters routed to Officials/Referees (group_id = 2)
+     and Goalkeepers/Specialists (group_id = 3)
 5. Temporal Track Smoothing:
    - Rolling majority vote (default 30 frames) with tie-break hysteresis per Track ID
-   - Eliminates player bounding box color flickering across frames
+   - Eliminates bounding box color flickering across frames
 
 Outputs: Annotated Video + Structured CSV/JSON Logs + Run Summary Diagnostics
 """
@@ -48,13 +53,21 @@ from sklearn.cluster import KMeans
 from sklearn.covariance import MinCovDet
 from sklearn.decomposition import PCA
 
-LOG = logging.getLogger("team_pipeline")
+LOG = logging.getLogger("sports_pipeline")
 
 GROUP_NAMES: Dict[int, str] = {
     0: "Team A",
     1: "Team B",
     2: "Officials",
     3: "Goalkeepers",
+    -1: "Unassigned",
+}
+
+GROUP_DESCRIPTIONS: Dict[int, str] = {
+    0: "Team A (Squad 1)",
+    1: "Team B (Squad 2)",
+    2: "Officials/Referees",
+    3: "Goalkeepers/Specialists (if applicable)",
     -1: "Unassigned",
 }
 
@@ -66,10 +79,10 @@ UNASSIGNED = -1
 
 # High-visibility BGR display palette
 FIXED_PALETTE: Dict[int, Tuple[int, int, int]] = {
-    0: (40, 60, 240),     # Team A: Bright Red/Coral
-    1: (240, 210, 40),    # Team B: Cyan/Sky Blue
-    2: (0, 240, 255),     # Officials: Neon Yellow / Gold
-    3: (255, 0, 255),     # Goalkeepers: Magenta / Fuchsia
+    0: (40, 60, 240),     # Team A (Squad 1): Bright Red/Coral
+    1: (240, 210, 40),    # Team B (Squad 2): Cyan/Sky Blue
+    2: (0, 240, 255),     # Officials/Referees: Neon Yellow / Gold
+    3: (255, 0, 255),     # Goalkeepers/Specialists: Magenta / Fuchsia
     -1: (170, 170, 170),  # Unassigned: Neutral Gray
 }
 
@@ -86,23 +99,22 @@ class PipelineConfig:
     iou: float = 0.6
     device: str = "auto"
     half: bool = False
-    tracker: str = "trackers/bytetrack_football.yaml"
-    pitch_filter: bool = True
-    pitch_min_green_frac: float = 0.15
+    tracker_config: str = "configs/bytetrack_sports.yaml"
+    surface_filter: bool = True
+    surface_min_area_frac: float = 0.15
 
-    # Stage 2 - strict torso mask & grass erosion
-    torso_top: float = 0.15       # 15% height
-    torso_bottom: float = 0.42    # 42% height
-    torso_left: float = 0.22      # 22% width
-    torso_right: float = 0.78     # 78% width
-    green_h_low: int = 35
-    green_h_high: int = 85
-    green_s_min: int = 40
-    green_v_min: int = 40
+    # Stage 2 - dynamic surface estimation & pure geometric torso isolation
+    torso_top: float = 0.18       # 18% of player height
+    torso_bottom: float = 0.40    # 40% of player height
+    torso_left: float = 0.25      # 25% of player width
+    torso_right: float = 0.75     # 75% of player width
+    surface_delta_thresh: float = 22.0   # CIELAB distance threshold to reject court/surface bleed
+    surface_hull_delta: float = 28.0     # CIELAB distance threshold to segment playing surface hull
+    surface_l_weight: float = 0.5        # down-weight L* when matching surface under stadium shadows
     erode_kernel_size: int = 3
-    erode_iterations: int = 2     # 2-pixel morphological erosion
+    erode_iterations: int = 2     # 2-pixel morphological erosion on silhouette mask
     min_box_h: int = 20
-    min_valid_pixels: int = 20
+    min_valid_pixels: int = 15
 
     # Stage 3 - feature space & lightness invariance
     features: str = "lab"        # "lab" | "lab+dinov2"
@@ -111,7 +123,7 @@ class PipelineConfig:
     hist_weight: float = 40.0
     dino_weight: float = 40.0
 
-    # Neon referee / outlier threshold check in HSV space
+    # Neon official / referee threshold check in HSV space
     neon_h_min: int = 25
     neon_h_max: int = 50
     neon_s_min: int = 185
@@ -192,57 +204,133 @@ def delta_e(lab_cv_1: np.ndarray, lab_cv_2: np.ndarray) -> float:
 
 
 # --------------------------------------------------------------------------- #
-# Stage 1b - Pitch Hull Filter
+# Stage 1b & 2a - Dynamic Playing Surface Estimator (Sport-Agnostic)
 # --------------------------------------------------------------------------- #
-class PitchFilter:
+class DynamicSurfaceEstimator:
+    """
+    Unsupervised, sport-agnostic playing surface estimator.
+
+    - Samples background pixels outside all detected person bounding boxes.
+    - Computes the dominant playing surface centroid in CIELAB using a fast
+      1-cluster K-Means center refined on inliers, plus inverse covariance.
+    - Builds a spatial convex hull of the playing surface (court / turf / clay / ice)
+      to reject off-court spectators, bench personnel, and camera operators.
+    - Provides pixel-level color distance rejection so candidate torso crops never
+      absorb court/surface bleed regardless of sport.
+    """
+
     def __init__(self, cfg: PipelineConfig, scale: float = 0.25):
         self.cfg = cfg
         self.scale = scale
-        self.mask: Optional[np.ndarray] = None
+        self.surface_lab_cv: Optional[np.ndarray] = None
+        self.surface_inv_cov: Optional[np.ndarray] = None
+        self.hull_mask: Optional[np.ndarray] = None
+        self.weights = np.array([cfg.surface_l_weight, 1.0, 1.0], dtype=np.float32)
+        self.km_criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 15, 0.5)
+        self._rng = np.random.default_rng(42)
 
-    def update(self, frame: np.ndarray) -> None:
+    def update(self, frame: np.ndarray, boxes: Optional[np.ndarray] = None) -> None:
         cfg = self.cfg
         small = cv2.resize(frame, None, fx=self.scale, fy=self.scale, interpolation=cv2.INTER_AREA)
-        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-        green = cv2.inRange(
-            hsv,
-            (cfg.green_h_low, cfg.green_s_min, cfg.green_v_min),
-            (cfg.green_h_high, 255, 255),
-        )
-        if green.mean() / 255.0 < cfg.pitch_min_green_frac:
-            self.mask = None
+        sH, sW = small.shape[:2]
+        lab_small = cv2.cvtColor(small, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+        # Mask out all detected person bounding boxes
+        person_mask = np.zeros((sH, sW), dtype=np.uint8)
+        if boxes is not None and len(boxes) > 0:
+            for b in boxes:
+                x1, y1, x2, y2 = (np.asarray(b[:4]) * self.scale).astype(int)
+                person_mask[max(0, y1 - 2):min(sH, y2 + 2), max(0, x1 - 2):min(sW, x2 + 2)] = 255
+
+        # Sample background pixels in the active playing zone spanned by players
+        if boxes is not None and len(boxes) >= 3:
+            ymin = int(max(0, np.min(boxes[:, 1]) * self.scale))
+            ymax = int(min(sH, np.max(boxes[:, 3]) * self.scale))
+            if ymax - ymin < int(0.15 * sH):
+                ymin, ymax = int(0.20 * sH), sH
+        else:
+            ymin, ymax = int(0.20 * sH), sH
+
+        zone_mask = np.zeros((sH, sW), dtype=np.uint8)
+        zone_mask[ymin:ymax, :] = 255
+        bg_mask = cv2.bitwise_and(zone_mask, cv2.bitwise_not(person_mask))
+        bg_px = lab_small[bg_mask > 0]
+
+        if len(bg_px) >= 64:
+            if len(bg_px) > 2000:
+                idx = self._rng.choice(len(bg_px), 2000, replace=False)
+                bg_px = bg_px[idx]
+            # Fast 1-cluster K-Means center refined on 70% closest inliers
+            _, _, centers = cv2.kmeans(bg_px.astype(np.float32), 1, None, self.km_criteria, 1, cv2.KMEANS_PP_CENTERS)
+            c0 = centers[0]
+            d = np.linalg.norm((bg_px - c0) * self.weights, axis=1)
+            inliers = bg_px[d <= np.percentile(d, 70)]
+            if len(inliers) >= 16:
+                new_center = inliers.mean(axis=0).astype(np.float32)
+                cov = np.cov(inliers.T) + np.eye(3, dtype=np.float32) * 4.0
+                self.surface_inv_cov = np.linalg.inv(cov).astype(np.float32)
+                if self.surface_lab_cv is None:
+                    self.surface_lab_cv = new_center
+                else:
+                    # Smooth exponential moving average across frames
+                    self.surface_lab_cv = 0.85 * self.surface_lab_cv + 0.15 * new_center
+
+        if self.surface_lab_cv is None:
+            self.hull_mask = None
             return
-        k = max(5, int(0.02 * small.shape[1]) | 1)
-        closed = cv2.morphologyEx(green, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+
+        # Segment playing surface via Euclidean distance in chroma-weighted CIELAB
+        dist_map = np.linalg.norm((lab_small - self.surface_lab_cv) * self.weights, axis=2)
+        surface_bin = ((dist_map < cfg.surface_hull_delta) * 255).astype(np.uint8)
+        if surface_bin.mean() / 255.0 < cfg.surface_min_area_frac:
+            self.hull_mask = None  # close-up shot -> disable spatial hull filtering
+            return
+
+        k = max(5, int(0.02 * sW) | 1)
+        closed = cv2.morphologyEx(
+            surface_bin, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        )
         contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        min_area = 0.01 * small.shape[0] * small.shape[1]
+        min_area = 0.01 * sH * sW
         big = [c for c in contours if cv2.contourArea(c) > min_area]
         if not big:
-            self.mask = None
+            self.hull_mask = None
             return
-        hull = cv2.convexHull(np.vstack(big))
-        mask = np.zeros(small.shape[:2], np.uint8)
-        cv2.fillConvexPoly(mask, hull, 255)
-        m = max(3, int(0.015 * small.shape[1]) | 1)
-        self.mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (m, m)))
 
-    def on_pitch(self, bbox: Sequence[float]) -> bool:
-        if self.mask is None:
+        hull = cv2.convexHull(np.vstack(big))
+        mask = np.zeros((sH, sW), dtype=np.uint8)
+        cv2.fillConvexPoly(mask, hull, 255)
+        m = max(3, int(0.015 * sW) | 1)
+        self.hull_mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (m, m)))
+
+    def on_surface(self, bbox: Sequence[float]) -> bool:
+        if not self.cfg.surface_filter or self.hull_mask is None:
             return True
         x1, y1, x2, y2 = bbox
-        fx = int(np.clip((x1 + x2) / 2 * self.scale, 0, self.mask.shape[1] - 1))
-        fy = int(np.clip(y2 * self.scale, 0, self.mask.shape[0] - 1))
-        return bool(self.mask[fy, fx])
+        fx = int(np.clip((x1 + x2) / 2.0 * self.scale, 0, self.hull_mask.shape[1] - 1))
+        fy = int(np.clip(y2 * self.scale, 0, self.hull_mask.shape[0] - 1))
+        return bool(self.hull_mask[fy, fx])
+
+    def non_surface_pixel_mask(self, lab_crop: np.ndarray) -> np.ndarray:
+        """
+        Rejects torso pixels whose chroma-weighted CIELAB distance to the discovered
+        playing surface centroid is within `surface_delta_thresh`.
+        """
+        if self.surface_lab_cv is None:
+            return np.full(lab_crop.shape[:2], 255, dtype=np.uint8)
+        diff = (lab_crop.astype(np.float32) - self.surface_lab_cv) * self.weights
+        dist = np.linalg.norm(diff, axis=2)
+        return np.where(dist >= self.cfg.surface_delta_thresh, 255, 0).astype(np.uint8)
 
 
 # --------------------------------------------------------------------------- #
-# Stages 2 & 3 - Strict Torso Mask, Green Erosion & CIELAB Features
+# Stages 2 & 3 - Pure Geometric Torso Isolation & CIELAB Features
 # --------------------------------------------------------------------------- #
 @dataclass
 class JerseyFeature:
     lab_cv: np.ndarray        # dominant colour, OpenCV 8-bit Lab
     hist: np.ndarray          # normalised a*b* histogram (bins*bins,)
-    n_valid: int              # valid pixels after torso mask, green filter & 2px erosion
+    n_valid: int              # valid pixels after torso crop, surface rejection & 2px erosion
     purity: float             # share of dominant colour cluster
     box_h: int
     is_neon: bool             # unsupervised neon anomaly flag
@@ -251,11 +339,15 @@ class JerseyFeature:
 
 
 class JerseyColorExtractor:
-    def __init__(self, cfg: PipelineConfig, keep_crop: bool = False):
+    def __init__(
+        self,
+        cfg: PipelineConfig,
+        surface_estimator: Optional[DynamicSurfaceEstimator] = None,
+        keep_crop: bool = False,
+    ):
         self.cfg = cfg
+        self.surface_estimator = surface_estimator
         self.keep_crop = keep_crop
-        self.lower_green = np.array([cfg.green_h_low, cfg.green_s_min, cfg.green_v_min], np.uint8)
-        self.upper_green = np.array([cfg.green_h_high, 255, 255], np.uint8)
         self.km_criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 0.5)
         self.erode_kernel = np.ones((cfg.erode_kernel_size, cfg.erode_kernel_size), np.uint8)
 
@@ -269,6 +361,7 @@ class JerseyColorExtractor:
         if h < self.cfg.min_box_h or w < 8:
             return None
         c = self.cfg
+        # Pure geometric upper-torso isolation: y in [18%, 40%], x in [25%, 75%]
         ty1, ty2 = y1 + int(h * c.torso_top), y1 + int(h * c.torso_bottom)
         tx1, tx2 = x1 + int(w * c.torso_left), x1 + int(w * c.torso_right)
         ty1, ty2 = max(0, min(H, ty1)), max(0, min(H, ty2))
@@ -305,28 +398,34 @@ class JerseyColorExtractor:
             return None
         tx1, ty1, tx2, ty2 = tb
         crop = frame[ty1:ty2, tx1:tx2]
-
-        # 1. Pitch-green HSV exclusion mask
+        lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        valid = cv2.bitwise_not(cv2.inRange(hsv, self.lower_green, self.upper_green))
 
-        # 2. Instance-segmentation silhouette intersection
+        # 1. Dynamic playing-surface color distance rejection (sport-agnostic)
+        if self.surface_estimator is not None:
+            valid = self.surface_estimator.non_surface_pixel_mask(lab)
+        else:
+            valid = np.full(crop.shape[:2], 255, dtype=np.uint8)
+
+        # 2. Instance-segmentation silhouette intersection + 2-pixel erosion on silhouette
         if polygon is not None and len(polygon) >= 3:
             seg = np.zeros(crop.shape[:2], np.uint8)
             poly = np.round(polygon - np.array([tx1, ty1], np.float32)).astype(np.int32)
             cv2.fillPoly(seg, [poly], 255)
+            eroded_seg = cv2.erode(seg, self.erode_kernel, iterations=self.cfg.erode_iterations)
+            if cv2.countNonZero(eroded_seg) >= self.cfg.min_valid_pixels:
+                seg = eroded_seg
             if cv2.countNonZero(seg) >= self.cfg.min_valid_pixels:
                 valid = cv2.bitwise_and(valid, seg)
 
-        # 3. 2-pixel morphological erosion prior to color sampling
+        # 3. 2-pixel morphological erosion on combined torso mask to strip boundary halo
         eroded = cv2.erode(valid, self.erode_kernel, iterations=self.cfg.erode_iterations)
         if cv2.countNonZero(eroded) >= self.cfg.min_valid_pixels:
             valid = eroded
 
-        # Check neon referee anomaly on the valid torso mask
+        # Check neon official anomaly on the valid torso mask
         is_neon = self.check_neon(hsv, valid)
 
-        lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
         px = lab[valid > 0].astype(np.float32)
         if len(px) < self.cfg.min_valid_pixels:
             return None
@@ -365,10 +464,13 @@ class JerseyColorExtractor:
 class TeamClusterer:
     """
     Unsupervised Over-Clustering Engine (K = 5):
-    - Fits KMeans / GMM with K = 5 over-clustering on warm-up features in PCA space.
-    - Designates the two highest-volume clusters as Team A (group_id = 0) and Team B (group_id = 1).
-    - Routes remaining lower-frequency clusters to Officials (group_id = 2) and Goalkeepers (group_id = 3).
-    - Hard neon threshold overrides route neon anomalies directly to Officials before centroid distance calculation.
+    - Fits KMeans with K = 5 over-clustering on warm-up features in PCA space.
+    - Designates the two highest-volume clusters as Team A (Squad 1, group_id = 0)
+      and Team B (Squad 2, group_id = 1).
+    - Routes remaining lower-frequency clusters to Officials/Referees (group_id = 2)
+      and Goalkeepers/Specialists (group_id = 3).
+    - Hard neon threshold overrides route neon anomalies directly to Officials
+      before centroid distance calculation.
     """
 
     def __init__(self, cfg: PipelineConfig, n_iter: int = 3):
@@ -442,13 +544,8 @@ class TeamClusterer:
         team_b_cluster = freq_sorted[1]
         outlier_clusters = freq_sorted[2:]
 
-        # Map K=5 clusters to groups:
-        # Cluster 0 -> Team A, Cluster 1 -> Team B
-        # Remaining lower-frequency clusters -> Officials (2) / Goalkeepers (3)
         cluster_to_group = {team_a_cluster: TEAM_A_GROUP, team_b_cluster: TEAM_B_GROUP}
         for rank, c_idx in enumerate(outlier_clusters):
-            # Split remaining clusters between Officials (2) and Goalkeepers (3)
-            # If cluster has neon detections, prefer Officials
             is_cluster_neon = bool(np.mean(neon_flags[labels == c_idx]) >= 0.05) if (labels == c_idx).any() else False
             if is_cluster_neon or rank == 0:
                 cluster_to_group[c_idx] = OFFICIALS_GROUP
@@ -456,7 +553,6 @@ class TeamClusterer:
                 cluster_to_group[c_idx] = GOALKEEPERS_GROUP
 
         # 3. Fit robust tied-covariance components for each group
-        initial_groups = np.array([cluster_to_group[l] for l in labels])
         comp_members = [labels == c for c in [team_a_cluster, team_b_cluster] + list(outlier_clusters)]
         comp_grps = [TEAM_A_GROUP, TEAM_B_GROUP] + [cluster_to_group[c] for c in outlier_clusters]
 
@@ -517,6 +613,7 @@ class TeamClusterer:
             "warmup_k5_counts": [int(counts[c]) for c in freq_sorted],
             "mahalanobis_threshold": round(self.threshold, 2),
             "warmup_group_sizes": {GROUP_NAMES[k]: int((grp == k).sum()) for k in (0, 1, 2, 3)},
+            "group_descriptions": {GROUP_NAMES[k]: GROUP_DESCRIPTIONS[k] for k in (0, 1, 2, 3)},
             "team_colors_bgr": [cv_lab_to_bgr(m) for m in self.team_lab_cv],
             "team_color_delta_e": round(delta_e(self.team_lab_cv[0], self.team_lab_cv[1]), 2),
         }
@@ -585,14 +682,14 @@ class MatchAnalysisPipeline:
         self.device = resolve_device(self.cfg.device)
         self._YOLO = YOLO
         self.model = YOLO(self.cfg.model)
-        self.extractor = JerseyColorExtractor(self.cfg, keep_crop=False)
-        self.pitch = PitchFilter(self.cfg)
+        self.surface = DynamicSurfaceEstimator(self.cfg)
+        self.extractor = JerseyColorExtractor(self.cfg, surface_estimator=self.surface, keep_crop=False)
         self.clusterer = TeamClusterer(self.cfg)
         self.smoother = TrackSmoother(self.cfg.vote_window)
         self.palette: Dict[int, Tuple[int, int, int]] = dict(FIXED_PALETTE)
         self.is_fitted = False
         cv2.setRNGSeed(42)
-        LOG.info("Initialized pipeline. Device: %s, Model: %s, Imgsz: %d",
+        LOG.info("Initialized universal sports pipeline. Device: %s, Model: %s, Imgsz: %d",
                  self.device, self.cfg.model, self.cfg.imgsz)
 
     def _infer_kwargs(self, conf: float) -> dict:
@@ -644,16 +741,15 @@ class MatchAnalysisPipeline:
             if idx % c.warmup_stride == 0:
                 res = det_model.predict(frame, **self._infer_kwargs(c.warmup_conf))[0]
                 if res.boxes is not None and len(res.boxes):
-                    if c.pitch_filter:
-                        self.pitch.update(frame)
                     boxes = res.boxes.xyxy.cpu().numpy()
                     polys = res.masks.xy if res.masks is not None else [None] * len(boxes)
+                    self.surface.update(frame, boxes)
                     med_h = float(np.median(boxes[:, 3] - boxes[:, 1]))
                     thr_h = max(min_h, c.warmup_rel_box_h * med_h)
                     for bbox, poly in zip(boxes, polys):
                         if bbox[3] - bbox[1] < thr_h:
                             continue
-                        if c.pitch_filter and not self.pitch.on_pitch(bbox):
+                        if not self.surface.on_surface(bbox):
                             continue
                         f = self.extractor.extract(frame, bbox, poly)
                         if f is None or f.purity < c.warmup_min_purity or f.n_valid < c.min_valid_pixels:
@@ -670,7 +766,17 @@ class MatchAnalysisPipeline:
         self.clusterer.fit(X, labs, neons)
         self.is_fitted = True
         self._build_palette()
-        st = dict(self.clusterer.stats, warmup_frames_scanned=idx)
+
+        surf_bgr = (
+            list(cv_lab_to_bgr(self.surface.surface_lab_cv))
+            if self.surface.surface_lab_cv is not None
+            else None
+        )
+        st = dict(
+            self.clusterer.stats,
+            playing_surface_bgr=surf_bgr,
+            warmup_frames_scanned=idx,
+        )
         LOG.info("Team model stats: %s", json.dumps(st))
         return st
 
@@ -708,14 +814,14 @@ class MatchAnalysisPipeline:
 
     def _hud(self, frame: np.ndarray, frame_id: int, counts: Counter) -> None:
         overlay = frame.copy()
-        cv2.rectangle(overlay, (12, 12), (360, 140), (20, 20, 20), -1)
+        cv2.rectangle(overlay, (12, 12), (380, 140), (20, 20, 20), -1)
         cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
-        cv2.putText(frame, f"Frame {frame_id} | Unsupervised Tracking", (22, 34),
+        cv2.putText(frame, f"Frame {frame_id} | Universal Sports Tracking", (22, 34),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
         for i, g in enumerate([0, 1, 2, 3]):
             y = 56 + i * 22
             cv2.rectangle(frame, (22, y - 12), (40, y + 2), self.palette[g], -1)
-            cv2.putText(frame, f"{GROUP_NAMES[g]}: {counts.get(g, 0)}", (50, y),
+            cv2.putText(frame, f"{GROUP_DESCRIPTIONS[g].split(' (')[0]}: {counts.get(g, 0)}", (50, y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
 
     def run(self, input_video: str, output_video: str = "output_match.mp4",
@@ -745,9 +851,7 @@ class MatchAnalysisPipeline:
             ok, frame = cap.read()
             if not ok:
                 break
-            res = self.model.track(frame, persist=True, tracker=c.tracker, **self._infer_kwargs(c.conf))[0]
-            if c.pitch_filter:
-                self.pitch.update(frame)
+            res = self.model.track(frame, persist=True, tracker=c.tracker_config, **self._infer_kwargs(c.conf))[0]
 
             dets = []
             if res.boxes is not None and res.boxes.id is not None and len(res.boxes):
@@ -755,12 +859,13 @@ class MatchAnalysisPipeline:
                 ids = res.boxes.id.cpu().numpy().astype(int)
                 confs = res.boxes.conf.cpu().numpy()
                 polys = res.masks.xy if res.masks is not None else [None] * len(boxes)
+                self.surface.update(frame, boxes)
+
                 feats, fidx = [], []
                 for bbox, pid, cf, poly in zip(boxes, ids, confs, polys):
-                    if c.pitch_filter and not self.pitch.on_pitch(bbox):
+                    if not self.surface.on_surface(bbox):
                         continue
                     f = self.extractor.extract(frame, bbox, poly)
-                    # Clamped bounding boxes
                     bx1, by1, bx2, by2 = bbox
                     clamped_box = [
                         max(0.0, min(float(W), float(bx1))),
@@ -778,6 +883,8 @@ class MatchAnalysisPipeline:
                     groups, gconf = self.clusterer.predict(self._vectors(feats), neons)
                     for j, g, gc in zip(fidx, groups, gconf):
                         dets[j][4], dets[j][5] = int(g), float(gc)
+            else:
+                self.surface.update(frame, None)
 
             counts: Counter = Counter()
             for bbox, pid, cf, f, raw_g, raw_conf in dets:
@@ -789,7 +896,6 @@ class MatchAnalysisPipeline:
                 self._draw(frame, bbox, pid, grp, f)
                 x1, y1, x2, y2 = (round(float(v), 1) for v in bbox)
 
-                # Ensure fully populated records with no null values
                 records.append({
                     "frame_id": int(frame_id),
                     "player_id": int(pid),
@@ -869,9 +975,11 @@ class MatchAnalysisPipeline:
 # --------------------------------------------------------------------------- #
 def build_parser() -> argparse.ArgumentParser:
     d = PipelineConfig()
-    p = argparse.ArgumentParser(description="Unsupervised team identification for broadcast footage.",
-                                formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--input", required=True, help="Input video path")
+    p = argparse.ArgumentParser(
+        description="Universal Zero-Annotation Sports Player Detection & Team Color Clustering.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--input", required=True, help="Input broadcast video path")
     p.add_argument("--output_video", default="output_match.mp4")
     p.add_argument("--output_csv", default="detections_log.csv")
     p.add_argument("--output_json", default="detections_log.json")
@@ -881,17 +989,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--conf", type=float, default=d.conf)
     p.add_argument("--device", default=d.device, help="auto | cpu | mps | cuda:0")
     p.add_argument("--half", action="store_true")
-    p.add_argument("--tracker", default=d.tracker)
+    p.add_argument("--tracker_config", "--tracker", dest="tracker_config", default=d.tracker_config,
+                   help="ByteTrack configuration file (sport-agnostic)")
     p.add_argument("--start_sec", type=float, default=d.start_sec)
     p.add_argument("--duration_sec", type=float, default=d.duration_sec)
     p.add_argument("--warmup_frames", type=int, default=d.warmup_frames)
     p.add_argument("--warmup_stride", type=int, default=d.warmup_stride)
     p.add_argument("--vote_window", type=int, default=d.vote_window)
     p.add_argument("--l_weight", type=float, default=d.l_weight, help="Down-weight lightness L*")
+    p.add_argument("--surface_delta_thresh", type=float, default=d.surface_delta_thresh,
+                   help="CIELAB distance threshold to reject court/surface background pixels")
     p.add_argument("--torso", type=float, nargs=2, default=[d.torso_top, d.torso_bottom],
-                   metavar=("TOP", "BOTTOM"))
+                   metavar=("TOP", "BOTTOM"), help="Vertical upper-torso crop bounds (default 0.18 0.40)")
     p.add_argument("--box_colors", choices=["auto", "jersey", "fixed"], default=d.box_colors)
-    p.add_argument("--no_pitch_filter", action="store_true")
+    p.add_argument("--no_surface_filter", "--no_pitch_filter", dest="no_surface_filter", action="store_true")
     p.add_argument("--no_h264", action="store_true")
     p.add_argument("--debug_torso", action="store_true")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -902,17 +1013,18 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict:
     a = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-    tracker = a.tracker
-    if not Path(tracker).exists():
-        local = Path(__file__).resolve().parent / tracker
-        tracker = str(local) if local.exists() else "bytetrack.yaml"
+    tracker_cfg = a.tracker_config
+    if not Path(tracker_cfg).exists():
+        local = Path(__file__).resolve().parent / tracker_cfg
+        tracker_cfg = str(local) if local.exists() else "bytetrack.yaml"
 
     cfg = PipelineConfig(
-        model=a.model, imgsz=a.imgsz, conf=a.conf, device=a.device, half=a.half, tracker=tracker,
-        start_sec=a.start_sec, duration_sec=a.duration_sec, warmup_frames=a.warmup_frames,
-        warmup_stride=a.warmup_stride, vote_window=a.vote_window, l_weight=a.l_weight,
+        model=a.model, imgsz=a.imgsz, conf=a.conf, device=a.device, half=a.half,
+        tracker_config=tracker_cfg, start_sec=a.start_sec, duration_sec=a.duration_sec,
+        warmup_frames=a.warmup_frames, warmup_stride=a.warmup_stride, vote_window=a.vote_window,
+        l_weight=a.l_weight, surface_delta_thresh=a.surface_delta_thresh,
         torso_top=a.torso[0], torso_bottom=a.torso[1], box_colors=a.box_colors,
-        pitch_filter=not a.no_pitch_filter, h264=not a.no_h264, debug_torso=a.debug_torso,
+        surface_filter=not a.no_surface_filter, h264=not a.no_h264, debug_torso=a.debug_torso,
     )
     pipe = MatchAnalysisPipeline(cfg)
     summary = pipe.run(a.input, a.output_video, a.output_csv, a.output_json, a.summary)
@@ -923,6 +1035,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict:
         "label_flips_raw": summary["label_flips_raw"],
         "label_flips_smoothed": summary["label_flips_smoothed"],
         "label_flip_rate_pct": summary["label_flip_rate_pct"],
+        "playing_surface_bgr": summary["team_model"].get("playing_surface_bgr"),
         "team_colors_bgr": summary["team_model"]["team_colors_bgr"],
         "team_color_delta_e": summary["team_model"]["team_color_delta_e"],
     }, indent=2))

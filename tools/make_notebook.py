@@ -1,4 +1,4 @@
-"""Generates run.ipynb synchronized with the updated architecture in pipeline.py."""
+"""Generates run.ipynb synchronized with the universal sport-agnostic architecture in pipeline.py."""
 import json
 from pathlib import Path
 
@@ -15,26 +15,27 @@ def code(s):
 
 
 md(r"""
-# Unsupervised Football Team Identification & Tracking Pipeline
-### Architectural Enhancements for Matra Analytics Sports Computer Vision
+# Universal Zero-Annotation Sports Player Detection & Team Color Clustering
+### Multi-Sport Computer Vision Pipeline (Football, Basketball, Tennis, Hockey, Volleyball, Rugby)
 
-This notebook walks through the production computer vision pipeline implemented in [`pipeline.py`](pipeline.py):
+This notebook walks through the universal, sport-agnostic computer vision pipeline implemented in [`pipeline.py`](pipeline.py):
 
-1. **Strict Torso Mask & Grass Erosion**:
-   - Sample upper torso: $15\%$ to $42\%$ height, $22\%$ to $78\%$ width.
-   - Dynamic pitch-green HSV exclusion mask ($H \in [35, 85], S > 40, V > 40$).
-   - 2-pixel morphological erosion (`cv2.erode` with $3\times3$ kernel, 2 iterations) to completely strip antialiased grass boundary bleed.
-2. **Neon & Outlier Separation (Referee / GK Isolation)**:
-   - Unsupervised over-clustering with $K = 5$ on the warmup sample bank.
-   - Frequency routing: Top 2 clusters $\to$ Team A (`group_id = 0`) & Team B (`group_id = 1`).
-   - Lower frequency clusters $\to$ Officials (`group_id = 2`) & Goalkeepers (`group_id = 3`).
-   - HSV neon threshold check ($S > 185, V > 195, 25 \le H \le 50$) tags neon referee jerseys before centroid distance calculation.
+1. **Dynamic Playing Surface Learning (Sport-Agnostic Background Rejection)**:
+   - Samples background pixels outside all detected person bounding boxes/masks.
+   - Computes the dominant playing surface centroid in CIELAB (`DynamicSurfaceEstimator`) using a fast 1-cluster K-Means center refined on inliers.
+   - Filters out candidate torso pixels falling within a color-distance threshold (`surface_delta_thresh`) of the court surface—dynamically eliminating green turf (football/rugby), tan hardwood (basketball/volleyball), blue/red clay (tennis), and white ice (hockey).
+2. **Pure Geometric Torso Isolation**:
+   - Samples the core upper-torso polygon: $y \in [18\%, 40\%]$ of player height and $x \in [25\%, 75\%]$ of player width.
+   - Applies a 2-pixel morphological erosion (`cv2.erode` with $3\times3$ kernel, 2 iterations) on the person silhouette mask to strip antialiased court/surface boundary bleed.
 3. **Feature Space & Lightness Invariance**:
    - Dominant CIELAB centroids via patch-level mini-KMeans ($k=2$).
-   - Down-weight lightness $L^*$ by $0.3$ relative to chromaticity channels ($a^*, b^*$) to prevent stadium lighting/shadow transitions from shifting cluster assignments.
-4. **Temporal Track Smoothing**:
-   - Rolling majority vote ($30$-frame window) with tie-break hysteresis per Track ID.
-   - Keeps label flip rate below $1\%$ across the entire match broadcast.
+   - Down-weights lightness $L^*$ by $0.3$ relative to chromaticity channels ($a^*, b^*$) to prevent arena/stadium shadow transitions from shifting cluster assignments.
+4. **Unsupervised Over-Clustering ($K=5$) & Generic Role Separation**:
+   - Frequency routing: Top 2 clusters $\to$ `Team A (Squad 1)` (`group_id = 0`) & `Team B (Squad 2)` (`group_id = 1`).
+   - Remaining lower-frequency clusters $\to$ `Officials/Referees` (`group_id = 2`) & `Goalkeepers/Specialists` (`group_id = 3`).
+   - Unsupervised HSV neon anomaly detector ($S > 185, V > 195, 25 \le H \le 50$) routes neon official jerseys prior to centroid distance calculation.
+5. **Temporal Track Smoothing**:
+   - Uses [`configs/bytetrack_sports.yaml`](configs/bytetrack_sports.yaml) and a 30-frame rolling majority vote with tie-break hysteresis per Track ID, keeping label flip rates below $1\%$.
 """)
 
 code(r"""
@@ -43,38 +44,44 @@ from pathlib import Path
 import pipeline as P
 
 INPUT = "data/0bfacc_0.mp4"
-cfg = P.PipelineConfig(duration_sec=3, warmup_frames=60)
+cfg = P.PipelineConfig(
+    tracker_config="configs/bytetrack_sports.yaml",
+    torso_top=0.18, torso_bottom=0.40,
+    torso_left=0.25, torso_right=0.75,
+    duration_sec=3, warmup_frames=60
+)
 pipe = P.MatchAnalysisPipeline(cfg)
-print(f"Pipeline initialized on device: {pipe.device}")
+print(f"Pipeline initialized on device: {pipe.device} | Tracker: {cfg.tracker_config}")
 """)
 
 md(r"""
-## Stage 2: Strict Torso Mask & 2-Pixel Grass Boundary Erosion
-Comparing raw bounding box vs. torso band vs. masked & 2-pixel eroded jersey pixels.
+## Stage 2: Dynamic Playing Surface Rejection & Pure Geometric Torso Isolation
+Comparing raw bounding box vs. core upper-torso band ($18\text{–}40\%$ H, $25\text{–}75\%$ W) vs. surface-rejected & 2px-eroded jersey pixels.
 """)
 
 code(r"""
 cap = cv2.VideoCapture(INPUT); cap.set(cv2.CAP_PROP_POS_FRAMES, 60); ok, frame = cap.read(); cap.release()
 res = pipe._YOLO(cfg.model).predict(frame, **pipe._infer_kwargs(0.5))[0]
 boxes, polys = res.boxes.xyxy.cpu().numpy(), res.masks.xy
+pipe.surface.update(frame, boxes)
 order = np.argsort(-(boxes[:, 3] - boxes[:, 1]))[:5]
 
-ex = P.JerseyColorExtractor(cfg, keep_crop=True)
+ex = P.JerseyColorExtractor(cfg, surface_estimator=pipe.surface, keep_crop=True)
 fig, axes = plt.subplots(len(order), 3, figsize=(8, 2.3 * len(order)))
 for r, i in enumerate(order):
     x1, y1, x2, y2 = boxes[i].astype(int)
     f = ex.extract(frame, boxes[i], polys[i])
     tx1, ty1, tx2, ty2 = f.torso
     for ax, img, t in zip(axes[r], [frame[y1:y2, x1:x2], frame[ty1:ty2, tx1:tx2], f.crop],
-                          ["Bounding Box", "Upper Torso (15-42% H, 22-78% W)", "Eroded Torso Mask (No Bleed)"]):
+                          ["Bounding Box", "Core Torso (18-40% H, 25-75% W)", "Surface-Rejected & Eroded"]):
         ax.imshow(img[:, :, ::-1]); ax.set_title(t, fontsize=9); ax.axis("off")
 plt.tight_layout()
 plt.show()
 """)
 
 md(r"""
-## Stage 4: Unsupervised Over-clustering (K=5) & Outlier Separation
-Inspect learned cluster centroids for Team A, Team B, Officials, and Goalkeepers.
+## Stage 4: Unsupervised Over-Clustering ($K=5$) & Generic Role Separation
+Inspect learned cluster centroids for `Team A (Squad 1)`, `Team B (Squad 2)`, `Officials/Referees`, and `Goalkeepers/Specialists`, plus the dynamically discovered playing surface color.
 """)
 
 code(r"""
@@ -85,15 +92,22 @@ print(f"Warmup samples: {tm['warmup_samples']}")
 print(f"PCA explained variance (6 dims): {tm['pca_explained_variance'] * 100:.2f}%")
 print(f"K=5 Cluster Sample Counts: {tm['warmup_k5_counts']}")
 print(f"Warmup Group Sizes: {tm['warmup_group_sizes']}")
+print(f"Discovered Playing Surface BGR: {tm.get('playing_surface_bgr')}")
 print(f"Team A vs Team B Delta E Separation: {tm['team_color_delta_e']:.2f}")
 
-swatches = [("Team A", tm["team_colors_bgr"][0]), ("Team B", tm["team_colors_bgr"][1])]
-fig, ax = plt.subplots(figsize=(6, 1.8))
+swatches = [
+    ("Team A (Squad 1)", tm["team_colors_bgr"][0]),
+    ("Team B (Squad 2)", tm["team_colors_bgr"][1]),
+]
+if tm.get("playing_surface_bgr"):
+    swatches.append(("Playing Surface", tm["playing_surface_bgr"]))
+
+fig, ax = plt.subplots(figsize=(2.4 * len(swatches), 1.8))
 for i, (name, bgr) in enumerate(swatches):
     ax.add_patch(plt.Rectangle((i, 0), 0.85, 1, color=np.array(bgr[::-1]) / 255.0))
-    ax.text(i + 0.425, -0.35, name, ha="center", fontsize=11, weight="bold")
+    ax.text(i + 0.425, -0.35, name, ha="center", fontsize=10, weight="bold")
 ax.set_xlim(0, len(swatches)); ax.set_ylim(-0.6, 1.1); ax.axis("off")
-plt.title(f"Discovered Team Jersey Colors (Delta E: {tm['team_color_delta_e']:.1f})", fontsize=12)
+plt.title(f"Discovered Kit & Playing Surface Colors (Delta E: {tm['team_color_delta_e']:.1f})", fontsize=12)
 plt.show()
 """)
 
@@ -154,12 +168,12 @@ plt.show()
 """)
 
 nb = {
-    "cells": cells, 
+    "cells": cells,
     "metadata": {
         "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
         "language_info": {"name": "python"}
-    }, 
-    "nbformat": 4, 
+    },
+    "nbformat": 4,
     "nbformat_minor": 5
 }
 Path("run.ipynb").write_text(json.dumps(nb, indent=1))

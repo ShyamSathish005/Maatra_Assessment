@@ -50,7 +50,18 @@
       ]
     ],
     "team_color_delta_e": 61.8,
-    "warmup_frames_scanned": 150
+    "warmup_frames_scanned": 150,
+    "playing_surface_bgr": [
+      67,
+      131,
+      102
+    ],
+    "group_descriptions": {
+      "Team A": "Team A (Squad 1)",
+      "Team B": "Team B (Squad 2)",
+      "Officials": "Officials/Referees",
+      "Goalkeepers": "Goalkeepers/Specialists (if applicable)"
+    }
   },
   "config": {
     "model": "yolov8x-seg.pt",
@@ -59,21 +70,20 @@
     "iou": 0.6,
     "device": "auto",
     "half": false,
-    "tracker": "trackers/bytetrack_football.yaml",
-    "pitch_filter": true,
-    "pitch_min_green_frac": 0.15,
-    "torso_top": 0.15,
-    "torso_bottom": 0.42,
-    "torso_left": 0.22,
-    "torso_right": 0.78,
-    "green_h_low": 35,
-    "green_h_high": 85,
-    "green_s_min": 40,
-    "green_v_min": 40,
+    "tracker_config": "configs/bytetrack_sports.yaml",
+    "surface_filter": true,
+    "surface_min_area_frac": 0.15,
+    "torso_top": 0.18,
+    "torso_bottom": 0.4,
+    "torso_left": 0.25,
+    "torso_right": 0.75,
+    "surface_delta_thresh": 22.0,
+    "surface_hull_delta": 28.0,
+    "surface_l_weight": 0.5,
     "erode_kernel_size": 3,
     "erode_iterations": 2,
     "min_box_h": 20,
-    "min_valid_pixels": 20,
+    "min_valid_pixels": 15,
     "features": "lab",
     "hist_bins": 16,
     "l_weight": 0.3,
